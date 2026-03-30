@@ -287,7 +287,7 @@ PRs welcome. Ideas:
 
 ## Related
 
-- [rd-credit-scanner](https://github.com/yourusername/rd-credit-scanner) — scan existing GitLab/GitHub issues for R&D credits
+-[ [rd-credit-scanner](https://github.com/yourusername/rd-credit-scanner)](https://github.com/lalunalalol/rd-credit-scanner) — scan existing GitLab/GitHub issues for R&D credits
 
 ---
 
