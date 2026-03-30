@@ -33,8 +33,21 @@ This tool surfaces that work, documents it properly, and creates the contemporan
 ## Requirements
 
 - Python 3.8+ (no external dependencies)
-- [Claude Code](https://claude.ai/code) installed locally (used for AI evaluation and as the AI coding tool)
+- [Claude Code](https://claude.ai/code) installed locally (used for AI evaluation)
 - A GitLab or GitHub personal access token
+
+**For Claude Code session logs:**
+Claude Code stores sessions automatically. No extra steps needed.
+
+**For Cursor session logs:**
+Cursor does not expose logs in a standard location. You need to export your chat history manually:
+1. Open Cursor
+2. Open the Command Palette (`Cmd+Shift+P` on Mac, `Ctrl+Shift+P` on Windows/Linux)
+3. Search for `Export Chat History` and run it
+4. Save the exported JSON file to a folder, e.g. `~/cursor-exports/`
+5. Pass that folder to the logger with `--logs-dir ~/cursor-exports/`
+
+
 
 ---
 
@@ -50,6 +63,51 @@ export GIT_TOKEN=your_gitlab_or_github_token
 Evaluation runs through Claude Code locally — no API key needed.
 
 ---
+
+## First run — Claude Code + Cursor combined
+
+This is the recommended first run. It scans both Claude Code (auto-detected) and your exported Cursor logs together, does a dry run so nothing is created yet, and lets you review what would be logged.
+
+**Step 1 — Export your Cursor history**
+Open Cursor → Command Palette → `Export Chat History` → save to `~/cursor-exports/`
+
+**Step 2 — Dry run to preview everything**
+```bash
+python logger.py \
+  --platform gitlab \
+  --repo mycompany/rd-log \
+  --months 1 \
+  --sources claude,cursor \
+  --logs-dir ~/cursor-exports/ \
+  --dry-run
+```
+
+You'll see every session Claude Code found automatically plus everything from your Cursor export, evaluated and grouped by week — but nothing is created yet.
+
+**Step 3 — Create the issues when you're happy**
+```bash
+python logger.py \
+  --platform gitlab \
+  --repo mycompany/rd-log \
+  --months 1 \
+  --sources claude,cursor \
+  --logs-dir ~/cursor-exports/
+```
+
+**GitHub version:**
+```bash
+python logger.py \
+  --platform github \
+  --repo mycompany/rd-log \
+  --months 1 \
+  --sources claude,cursor \
+  --logs-dir ~/cursor-exports/ \
+  --dry-run
+```
+
+---
+
+
 
 ## Recommended setup — dedicated R&D log repo
 

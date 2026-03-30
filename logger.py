@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import os
+import sqlite3 as sqlite
 import sys
 import glob
 import urllib.request
@@ -99,20 +100,24 @@ def read_claude_code_logs(cutoff):
 
 def read_cursor_logs(cutoff):
     """
-    Read Cursor chat logs.
-    Location: ~/.cursor/logs/chat/*.json  or  exported JSON files
-    Format: JSON array of {role, content, timestamp} or Cursor-specific format.
+    Read Cursor chat logs from SQLite database and/or JSON exports.
+    Primary: ~/Library/Application Support/Cursor/User/globalStorage/state.vscdb
+    Fallback: ~/.cursor/logs/chat/*.json, exported JSON files
     """
+    sessions = []
+
+    # Primary: read from Cursor's SQLite database
+    sessions.extend(_read_cursor_sqlite(cutoff))
+
+    # Fallback: check JSON file locations
     home = Path.home()
     patterns = [
         home / ".cursor" / "logs" / "chat" / "*.json",
         home / ".cursor" / "logs" / "*.json",
         home / ".cursor-tutor" / "*.json",
-        # Also check current directory for exported files
         Path(".") / "cursor_export*.json",
         Path(".") / "cursor_logs" / "*.json",
     ]
-    sessions = []
     seen = set()
     for pattern in patterns:
         for path in glob.glob(str(pattern)):
@@ -122,6 +127,128 @@ def read_cursor_logs(cutoff):
             session = _parse_json_array(path, cutoff, source="Cursor")
             if session:
                 sessions.append(session)
+    return sessions
+
+
+def _read_cursor_sqlite(cutoff):
+    """
+    Read Cursor conversations from the SQLite state database.
+    Conversations are stored as composerData entries with bubble messages.
+    """
+    home = Path.home()
+    db_path = home / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    if not db_path.exists():
+        # Try Linux path
+        db_path = home / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    if not db_path.exists():
+        return []
+
+    sessions = []
+    try:
+        conn = sqlite.connect(str(db_path))
+        conn.row_factory = sqlite.Row
+        cursor = conn.cursor()
+
+        # Load all composerData entries (conversation metadata)
+        cursor.execute(
+            "SELECT key, CAST(value AS TEXT) FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
+        )
+        composers = []
+        for row in cursor:
+            try:
+                data = json.loads(row[1])
+                composers.append(data)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        # Load all bubble messages into a dict keyed by bubbleId
+        cursor.execute(
+            "SELECT key, CAST(value AS TEXT) FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"
+        )
+        bubbles = {}
+        for row in cursor:
+            key = row[0]  # bubbleId:composerId:bubbleId
+            try:
+                bubbles[key] = json.loads(row[1])
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        conn.close()
+
+        # Build sessions from each conversation
+        for composer in composers:
+            headers = composer.get("fullConversationHeadersOnly", [])
+            if not headers:
+                continue
+
+            composer_id = composer.get("composerId", "")
+            created_ms = composer.get("createdAt", 0)
+            updated_ms = composer.get("lastUpdatedAt", 0)
+
+            if not created_ms:
+                continue
+
+            first_ts = datetime.fromtimestamp(created_ms / 1000).strftime("%Y-%m-%dT%H:%M:%S")
+            last_ts = datetime.fromtimestamp(updated_ms / 1000).strftime("%Y-%m-%dT%H:%M:%S") if updated_ms else first_ts
+            session_date = first_ts[:10]
+
+            if cutoff and session_date < cutoff:
+                continue
+
+            # Collect messages from bubbles
+            messages = []
+            for header in headers:
+                bubble_id = header.get("bubbleId", "")
+                msg_type = header.get("type", 0)  # 1=user, 2=assistant
+                bubble_key = f"bubbleId:{composer_id}:{bubble_id}"
+                bubble = bubbles.get(bubble_key)
+                if not bubble:
+                    continue
+                text = bubble.get("text", "")
+                if not text:
+                    continue
+                role = "user" if msg_type == 1 else "assistant"
+                messages.append({"role": role, "content": text, "timestamp": ""})
+
+            if not messages:
+                continue
+
+            user_messages = [m["content"] for m in messages if m["role"] == "user"]
+
+            # Estimate duration from created/updated timestamps
+            duration_minutes = None
+            if created_ms and updated_ms and updated_ms > created_ms:
+                duration_minutes = max(1, int((updated_ms - created_ms) / 60000))
+
+            # Build conversation sample (first 8 exchanges)
+            sample = []
+            for msg in messages[:16]:
+                role_label = "Developer" if msg["role"] == "user" else "AI"
+                sample.append(f"{role_label}: {msg['content'][:300]}")
+
+            conv_name = composer.get("name", "")
+            sessions.append({
+                "source": "Cursor",
+                "path": f"cursor:sqlite:{composer_id}",
+                "date": session_date,
+                "week": week_key(session_date),
+                "first_ts": first_ts,
+                "last_ts": last_ts,
+                "duration_minutes": duration_minutes,
+                "message_count": len(messages),
+                "user_message_count": len(user_messages),
+                "first_user_message": user_messages[0][:400] if user_messages else conv_name[:400],
+                "conversation_sample": "\n\n".join(sample)[:3000],
+                "verdict": None,
+                "confidence": None,
+                "reason": None,
+                "technical_uncertainty": None,
+            })
+
+    except Exception as e:
+        print(f"  Warning: could not read Cursor SQLite database: {e}")
+        return []
+
     return sessions
 
 
