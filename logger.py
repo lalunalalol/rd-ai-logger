@@ -18,7 +18,6 @@ Usage:
 import argparse
 import json
 import os
-import sqlite3 as sqlite
 import sys
 import glob
 import urllib.request
@@ -100,24 +99,20 @@ def read_claude_code_logs(cutoff):
 
 def read_cursor_logs(cutoff):
     """
-    Read Cursor chat logs from SQLite database and/or JSON exports.
-    Primary: ~/Library/Application Support/Cursor/User/globalStorage/state.vscdb
-    Fallback: ~/.cursor/logs/chat/*.json, exported JSON files
+    Read Cursor chat logs.
+    Location: ~/.cursor/logs/chat/*.json  or  exported JSON files
+    Format: JSON array of {role, content, timestamp} or Cursor-specific format.
     """
-    sessions = []
-
-    # Primary: read from Cursor's SQLite database
-    sessions.extend(_read_cursor_sqlite(cutoff))
-
-    # Fallback: check JSON file locations
     home = Path.home()
     patterns = [
         home / ".cursor" / "logs" / "chat" / "*.json",
         home / ".cursor" / "logs" / "*.json",
         home / ".cursor-tutor" / "*.json",
+        # Also check current directory for exported files
         Path(".") / "cursor_export*.json",
         Path(".") / "cursor_logs" / "*.json",
     ]
+    sessions = []
     seen = set()
     for pattern in patterns:
         for path in glob.glob(str(pattern)):
@@ -127,128 +122,6 @@ def read_cursor_logs(cutoff):
             session = _parse_json_array(path, cutoff, source="Cursor")
             if session:
                 sessions.append(session)
-    return sessions
-
-
-def _read_cursor_sqlite(cutoff):
-    """
-    Read Cursor conversations from the SQLite state database.
-    Conversations are stored as composerData entries with bubble messages.
-    """
-    home = Path.home()
-    db_path = home / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
-    if not db_path.exists():
-        # Try Linux path
-        db_path = home / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
-    if not db_path.exists():
-        return []
-
-    sessions = []
-    try:
-        conn = sqlite.connect(str(db_path))
-        conn.row_factory = sqlite.Row
-        cursor = conn.cursor()
-
-        # Load all composerData entries (conversation metadata)
-        cursor.execute(
-            "SELECT key, CAST(value AS TEXT) FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
-        )
-        composers = []
-        for row in cursor:
-            try:
-                data = json.loads(row[1])
-                composers.append(data)
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-        # Load all bubble messages into a dict keyed by bubbleId
-        cursor.execute(
-            "SELECT key, CAST(value AS TEXT) FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"
-        )
-        bubbles = {}
-        for row in cursor:
-            key = row[0]  # bubbleId:composerId:bubbleId
-            try:
-                bubbles[key] = json.loads(row[1])
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-        conn.close()
-
-        # Build sessions from each conversation
-        for composer in composers:
-            headers = composer.get("fullConversationHeadersOnly", [])
-            if not headers:
-                continue
-
-            composer_id = composer.get("composerId", "")
-            created_ms = composer.get("createdAt", 0)
-            updated_ms = composer.get("lastUpdatedAt", 0)
-
-            if not created_ms:
-                continue
-
-            first_ts = datetime.fromtimestamp(created_ms / 1000).strftime("%Y-%m-%dT%H:%M:%S")
-            last_ts = datetime.fromtimestamp(updated_ms / 1000).strftime("%Y-%m-%dT%H:%M:%S") if updated_ms else first_ts
-            session_date = first_ts[:10]
-
-            if cutoff and session_date < cutoff:
-                continue
-
-            # Collect messages from bubbles
-            messages = []
-            for header in headers:
-                bubble_id = header.get("bubbleId", "")
-                msg_type = header.get("type", 0)  # 1=user, 2=assistant
-                bubble_key = f"bubbleId:{composer_id}:{bubble_id}"
-                bubble = bubbles.get(bubble_key)
-                if not bubble:
-                    continue
-                text = bubble.get("text", "")
-                if not text:
-                    continue
-                role = "user" if msg_type == 1 else "assistant"
-                messages.append({"role": role, "content": text, "timestamp": ""})
-
-            if not messages:
-                continue
-
-            user_messages = [m["content"] for m in messages if m["role"] == "user"]
-
-            # Estimate duration from created/updated timestamps
-            duration_minutes = None
-            if created_ms and updated_ms and updated_ms > created_ms:
-                duration_minutes = max(1, int((updated_ms - created_ms) / 60000))
-
-            # Build conversation sample (first 8 exchanges)
-            sample = []
-            for msg in messages[:16]:
-                role_label = "Developer" if msg["role"] == "user" else "AI"
-                sample.append(f"{role_label}: {msg['content'][:300]}")
-
-            conv_name = composer.get("name", "")
-            sessions.append({
-                "source": "Cursor",
-                "path": f"cursor:sqlite:{composer_id}",
-                "date": session_date,
-                "week": week_key(session_date),
-                "first_ts": first_ts,
-                "last_ts": last_ts,
-                "duration_minutes": duration_minutes,
-                "message_count": len(messages),
-                "user_message_count": len(user_messages),
-                "first_user_message": user_messages[0][:400] if user_messages else conv_name[:400],
-                "conversation_sample": "\n\n".join(sample)[:3000],
-                "verdict": None,
-                "confidence": None,
-                "reason": None,
-                "technical_uncertainty": None,
-            })
-
-    except Exception as e:
-        print(f"  Warning: could not read Cursor SQLite database: {e}")
-        return []
-
     return sessions
 
 
@@ -365,16 +238,37 @@ def _build_session(path, messages, cutoff, source):
     user_messages = [m["content"] for m in messages if m["role"] in ("user", "human")]
     assistant_messages = [m["content"] for m in messages if m["role"] in ("assistant", "ai", "model")]
 
-    # Estimate duration from timestamps
+    # Estimate duration — use timestamp gap but cap at 4h (240 min) per session.
+    # Claude Code stores entire project history in one file, so first→last timestamp
+    # span can be days or weeks. We cap to avoid inflated numbers.
+    # Fallback: estimate from message count (avg 3 min per exchange pair).
+    MAX_SESSION_MINUTES = 240  # 4 hours hard cap per session
+    MSG_MINUTES_ESTIMATE = 3   # avg minutes per user/assistant exchange
+
     duration_minutes = None
     if first_ts and last_ts and first_ts != last_ts:
         try:
             fmt = "%Y-%m-%dT%H:%M:%S"
             t1 = datetime.strptime(first_ts[:19], fmt)
             t2 = datetime.strptime(last_ts[:19], fmt)
-            duration_minutes = max(1, int((t2 - t1).total_seconds() / 60))
+            raw_minutes = int((t2 - t1).total_seconds() / 60)
+            if raw_minutes > MAX_SESSION_MINUTES:
+                # Timestamp span is unreliable — fall back to message count estimate
+                duration_minutes = min(
+                    len(user_messages) * MSG_MINUTES_ESTIMATE,
+                    MAX_SESSION_MINUTES
+                )
+            else:
+                duration_minutes = max(1, raw_minutes)
         except Exception:
             pass
+
+    # If still no duration, estimate from message count
+    if not duration_minutes:
+        duration_minutes = min(
+            max(1, len(user_messages) * MSG_MINUTES_ESTIMATE),
+            MAX_SESSION_MINUTES
+        )
 
     # Build conversation sample for AI evaluation (first 8 exchanges)
     sample = []
@@ -400,6 +294,7 @@ def _build_session(path, messages, cutoff, source):
         "confidence": None,
         "reason": None,
         "technical_uncertainty": None,
+        "summary": None,
     }
 
 
@@ -427,12 +322,20 @@ NOT qualifying:
 - Formatting, linting, or refactoring with known outcome
 - Non-technical questions (writing copy, emails, docs)
 
+IMPORTANT RULES:
+- "summary" is ALWAYS required — 2-3 sentences describing what technical problem was being solved
+  and what approach was taken. Never use the raw first message as the summary.
+- "technical_uncertainty" is REQUIRED for Qualifying and Needs Review verdicts.
+  If you cannot identify a specific technical uncertainty, set verdict to "Needs Review".
+- Do not leave technical_uncertainty blank for qualifying sessions.
+
 Respond ONLY with a valid JSON object, no markdown:
 {
   "verdict": "Qualifying" | "Needs Review" | "Not Qualifying",
   "confidence": 0-100,
   "reason": "one sentence explaining the verdict",
-  "technical_uncertainty": "one sentence describing what was technically uncertain (if qualifying)"
+  "technical_uncertainty": "one sentence describing what was technically uncertain — REQUIRED if Qualifying or Needs Review, empty string only if Not Qualifying",
+  "summary": "2-3 sentence description of what technical problem was being solved and what approach was explored"
 }"""
 
 
@@ -445,10 +348,11 @@ def evaluate_session(session):
         f"Source: {session['source']}\n"
         f"Date: {session['date']}\n"
         f"Messages: {session['message_count']} total, {session['user_message_count']} from developer\n"
-        f"Duration: {session['duration_minutes']} minutes\n\n"
+        f"Estimated duration: {session['duration_minutes']} minutes\n\n"
         f"First developer message:\n{session['first_user_message']}\n\n"
         f"Conversation sample:\n{session['conversation_sample']}\n\n"
-        f"Respond with ONLY a JSON object, no markdown."
+        f"Respond with ONLY a JSON object, no markdown. "
+        f"Remember: summary and technical_uncertainty are both required fields."
     )
     try:
         result = subprocess.run(
@@ -460,7 +364,23 @@ def evaluate_session(session):
         )
         text = result.stdout.strip()
         text = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
+        data = json.loads(text)
+
+        # Enforce: if Qualifying or Needs Review but technical_uncertainty is empty,
+        # downgrade to Needs Review and flag it
+        verdict = data.get("verdict", "Needs Review")
+        tech_uncertainty = data.get("technical_uncertainty", "").strip()
+        if verdict in ("Qualifying", "Needs Review") and not tech_uncertainty:
+            data["verdict"] = "Needs Review"
+            data["technical_uncertainty"] = "Could not extract — please review session manually"
+            data["confidence"] = min(data.get("confidence", 0), 40)
+
+        # Enforce: summary must not be empty or a raw message dump
+        summary = data.get("summary", "").strip()
+        if not summary or len(summary) < 20:
+            data["summary"] = "Summary unavailable — review conversation manually"
+
+        return data
     except FileNotFoundError:
         print("\n  Error: 'claude' command not found.")
         print("  Make sure Claude Code is installed: https://claude.ai/code")
@@ -470,7 +390,8 @@ def evaluate_session(session):
             "verdict": "Needs Review",
             "confidence": 0,
             "reason": f"Evaluation error: {e}",
-            "technical_uncertainty": ""
+            "technical_uncertainty": "Could not evaluate — review manually",
+            "summary": "Evaluation failed — review conversation manually",
         }
 
 
@@ -509,9 +430,14 @@ def build_issue_body(week, sessions):
         f"",
     ]
 
-    for s in qualifying:
-        if s.get("technical_uncertainty"):
-            lines.append(f"- {s['technical_uncertainty']}")
+    # Include technical uncertainty from both qualifying and needs review
+    for s in sessions:
+        if s.get("technical_uncertainty") and s["verdict"] != "Not Qualifying":
+            tag = "" if s["verdict"] == "Qualifying" else " *(needs review)*"
+            lines.append(f"- {s['technical_uncertainty']}{tag}")
+
+    if not any(s.get("technical_uncertainty") for s in sessions):
+        lines.append("- *No technical uncertainty extracted — please review sessions manually*")
 
     lines += [
         f"",
@@ -519,15 +445,17 @@ def build_issue_body(week, sessions):
         f"",
         f"## Sessions",
         f"",
-        f"| Date | Source | Duration | Verdict | Confidence | Summary |",
+        f"| Date | Source | Est. Hours | Verdict | Confidence | Summary |",
         f"|---|---|---|---|---|---|",
     ]
 
     for s in sessions:
-        duration = f"{s['duration_minutes']}min" if s["duration_minutes"] else "—"
-        summary = s["first_user_message"][:80].replace("\n", " ").replace("|", "/")
+        hours = f"{round((s['duration_minutes'] or 0) / 60, 1)}h"
+        # Use AI-generated summary, fall back to truncated first message only if missing
+        summary = (s.get("summary") or s["first_user_message"][:80])
+        summary = summary[:120].replace("\n", " ").replace("|", "/")
         lines.append(
-            f"| {s['date']} | {s['source']} | {duration} "
+            f"| {s['date']} | {s['source']} | {hours} "
             f"| {s['verdict']} | {s['confidence']}% | {summary} |"
         )
 
@@ -744,6 +672,7 @@ def main():
         session["confidence"] = result.get("confidence", 0)
         session["reason"] = result.get("reason", "")
         session["technical_uncertainty"] = result.get("technical_uncertainty", "")
+        session["summary"] = result.get("summary", "")
         print(f"    → {session['verdict']} ({session['confidence']}%)")
 
     qualifying_count = sum(1 for s in all_sessions if s["verdict"] == "Qualifying")
@@ -892,15 +821,31 @@ def _build_session(path, messages, cutoff, source):
     if cutoff and session_date < cutoff:
         return None
     user_messages = [m["content"] for m in messages if m["role"] in ("user", "human")]
+
+    MAX_SESSION_MINUTES = 240
+    MSG_MINUTES_ESTIMATE = 3
     duration_minutes = None
     if first_ts and last_ts and first_ts != last_ts:
         try:
             fmt = "%Y-%m-%dT%H:%M:%S"
             t1 = datetime.strptime(first_ts[:19], fmt)
             t2 = datetime.strptime(last_ts[:19], fmt)
-            duration_minutes = max(1, int((t2 - t1).total_seconds() / 60))
+            raw_minutes = int((t2 - t1).total_seconds() / 60)
+            if raw_minutes > MAX_SESSION_MINUTES:
+                duration_minutes = min(
+                    len(user_messages) * MSG_MINUTES_ESTIMATE,
+                    MAX_SESSION_MINUTES
+                )
+            else:
+                duration_minutes = max(1, raw_minutes)
         except Exception:
             pass
+    if not duration_minutes:
+        duration_minutes = min(
+            max(1, len(user_messages) * MSG_MINUTES_ESTIMATE),
+            MAX_SESSION_MINUTES
+        )
+
     sample = []
     for msg in messages[:16]:
         role_label = "Developer" if msg["role"] in ("user", "human") else "AI"
@@ -921,6 +866,7 @@ def _build_session(path, messages, cutoff, source):
         "confidence": None,
         "reason": None,
         "technical_uncertainty": None,
+        "summary": None,
     }
 
 
